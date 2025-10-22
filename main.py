@@ -340,6 +340,27 @@ async def create_tg_app() -> Application:
     app.add_handler(CommandHandler("unsubscribe", cmd_unsub))
     return app
 
+async def ensure_chromium_installed():
+    # Usa la ruta de caché típica de Render/Playwright
+    browsers_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
+    # ¿ya existe un binario chrome?
+    chrome = None
+    for p in browsers_path.rglob("chrome-linux/chrome"):
+        chrome = p
+        break
+    if chrome and chrome.exists():
+        logging.info("Chromium ya está instalado en: %s", chrome)
+        return
+    logging.info("Chromium no encontrado. Instalando con 'python -m playwright install chromium'...")
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "playwright", "install", "chromium",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    out, _ = await proc.communicate()
+    logging.info("Salida de playwright install:\n%s", out.decode(errors="ignore"))
+    if proc.returncode != 0:
+        raise RuntimeError("No se pudo instalar Chromium (playwright install falló).")
+
 async def on_startup(aio_app: web.Application):
     tg_app = await create_tg_app()
 
