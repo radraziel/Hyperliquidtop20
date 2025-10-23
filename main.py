@@ -1,517 +1,416 @@
-# main.py
 import os
 import re
-import sys
 import json
 import asyncio
 import logging
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import List, Dict, Any, Optional
 
+import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
+# ---------- Config & Logging ----------
+
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "hlhook")
+BROADCAST_CHATID = os.getenv("BROADCAST_CHATID")  # opcional
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
+PORT = int(os.getenv("PORT", "10000"))
+HOST = "0.0.0.0"
+
+# Dónde instaló Render el Chromium de Playwright en build
+# (coincide con el BUILD COMMAND que te doy más abajo)
+PLAYWRIGHT_BIN_HINTS = [
+    "/opt/render/project/src/.playwright/chromium-1140/chrome-linux/chrome",
+    "/opt/render/.cache/ms-playwright/chromium-1140/chrome-linux/chrome",
+]
+
+LOG_LEVEL = logging.DEBUG if DEBUG else logging.INFO
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
 )
-logger = logging.getLogger("hyperliquid-top20-bot")
+log = logging.getLogger("hyperliquid-top20-bot")
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "")
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hlhook")
-PORT = int(os.environ.get("PORT", "10000"))
+if not BOT_TOKEN or not BASE_URL:
+    log.warning("Faltan TELEGRAM_TOKEN y/o BASE_URL en variables de entorno.")
 
-BROADCAST_CHAT_ID = os.environ.get("BROADCAST_CHAT_ID")
-PUSH_EVERY_SECONDS = int(os.environ.get("PUSH_EVERY_SECONDS", "900"))
+# ---------- Utilidades ----------
 
-PLAYWRIGHT_BROWSERS_PATH = os.environ.get(
-    "PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.playwright"
-)
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_PATH
-
-HYPERDASH_URL = "https://hyperdash.info/top-traders"
-
-# ----------------------- Utils -----------------------
-@dataclass
-class TopRow:
-    rank: int
-    symbol: str
-    side: str
-    size_usd_text: str
-    size_usd_num: float
-    owner: str
-    address: str
-
-MULTS = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
-
-def usd_to_float(s: str) -> float:
-    if not s:
-        return 0.0
-    txt = s.strip().upper().replace(",", "")
-    mult = 1.0
-    m = re.search(r"([KMB])\b", txt)
-    if m:
-        mult = MULTS.get(m.group(1), 1.0)
-    n = re.search(r"-?\$?\s*(\d+(\.\d+)?)", txt)
-    if not n:
-        return 0.0
-    return float(n.group(1)) * mult
-
-def format_amount(n: float) -> str:
-    n = float(n)
-    sign = "-" if n < 0 else ""
-    n = abs(n)
-    if n >= 1_000_000_000:
-        return f"{sign}${n/1_000_000_000:.2f}B"
-    if n >= 1_000_000:
-        return f"{sign}${n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{sign}${n/1_000:.2f}K"
-    return f"{sign}${n:,.0f}"
-
-def guess_side(texts: Iterable[str]) -> str:
-    joined = " ".join([t.lower() for t in texts if t])
-    if "short" in joined:
-        return "short"
-    if "long" in joined:
-        return "long"
-    return "-"
-
-def find_first_addr(texts: Iterable[str]) -> str:
-    for t in texts:
-        if not t:
-            continue
-        m = re.search(r"0x[a-fA-F0-9]{6,}", t)
-        if m:
-            return m.group(0)
-    return ""
-
-# ----------------- Playwright bootstrap -----------------
-async def ensure_chromium_installed() -> None:
-    from pathlib import Path
-    browsers_path = Path(PLAYWRIGHT_BROWSERS_PATH)
-    chrome = None
-    if browsers_path.exists():
-        for p in browsers_path.rglob("chrome-linux/chrome"):
-            chrome = p
-            break
-    if chrome:
-        logger.info("Chromium ya está en: %s", chrome)
-        return
-
-    logger.info("Chromium no encontrado. Instalando en runtime…")
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "playwright", "install", "chromium",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    logger.info("Salida install:\n%s", out.decode(errors="ignore"))
-    if proc.returncode != 0:
-        raise RuntimeError("No se pudo instalar Chromium.")
-
-# ----------------- Scraper robusto -----------------
-from playwright.async_api import async_playwright
-
-def walk_json(node: Any) -> Iterable[Any]:
-    """Recorre un JSON anidado y rinde todos los dict/list internos."""
-    if isinstance(node, dict):
-        yield node
-        for v in node.values():
-            yield from walk_json(v)
-    elif isinstance(node, list):
-        for x in node:
-            yield from walk_json(x)
-
-def extract_candidates_from_json(j: Any) -> List[TopRow]:
+def format_money(s: str) -> str:
     """
-    Busca objetos que parezcan filas: que tengan monto en USD, símbolo, etc.
-    Heurística genérica para adaptarnos a cambios.
+    Normaliza strings como '$139.86M' o '139,860,000' a '$139.86M' cuando se puede.
+    Solo para mejor display; no es crítico para la lógica.
     """
-    rows: List[TopRow] = []
-    for obj in walk_json(j):
-        if not isinstance(obj, dict):
-            continue
+    s = s.strip()
+    if s.startswith("$"):
+        return s
+    # intenta como número plano
+    try:
+        v = float(s.replace(",", ""))
+        if abs(v) >= 1_000_000_000:
+            return f"${v/1_000_000_000:.2f}B"
+        if abs(v) >= 1_000_000:
+            return f"${v/1_000_000:.2f}M"
+        if abs(v) >= 1_000:
+            return f"${v/1_000:.2f}K"
+        return f"${v:.2f}"
+    except Exception:
+        return s
 
-        # posibles llaves de USD/texto
-        usd_fields = [
-            "mainPosition", "main_position", "positionUsd", "mainUsd", "usd",
-            "notionalUsd", "pv", "sizeUsd", "valueUsd"
-        ]
-        text_fields = [
-            "mainPositionText", "main_position_text", "positionUsdText",
-            "sizeUsdText", "pvText", "valueText"
-        ]
+def chromium_executable() -> Optional[str]:
+    for p in PLAYWRIGHT_BIN_HINTS:
+        if os.path.exists(p):
+            return p
+    return None
 
-        size_val: Optional[float] = None
-        size_txt: Optional[str] = None
+# ---------- Scraper /top con Playwright ----------
 
-        # intenta numérica primero
-        for k in usd_fields:
-            if k in obj and isinstance(obj[k], (int, float, str)):
-                if isinstance(obj[k], str):
-                    size_val = usd_to_float(obj[k])
-                    size_txt = obj[k]
-                else:
-                    size_val = float(obj[k])
-                    size_txt = format_amount(size_val)
-                break
-
-        # si no, intenta textual que traiga $
-        if size_val is None:
-            for k in text_fields:
-                if k in obj and isinstance(obj[k], str) and "$" in obj[k]:
-                    size_txt = obj[k]
-                    size_val = usd_to_float(obj[k])
-                    break
-
-        if size_val is None or size_val == 0:
-            continue
-
-        # símbolo / par
-        symbol = obj.get("symbol") or obj.get("asset") or obj.get("pair") or "-"
-        if isinstance(symbol, dict):
-            symbol = symbol.get("name") or symbol.get("symbol") or "-"
-
-        # lado
-        side = obj.get("side") or obj.get("positionSide") or "-"
-        if isinstance(side, dict):
-            side = side.get("name") or "-"
-
-        # owner/address
-        owner = obj.get("owner") or obj.get("name") or ""
-        address = (
-            obj.get("address") or obj.get("wallet") or obj.get("trader") or ""
-        )
-        if isinstance(address, dict):
-            address = address.get("address") or address.get("id") or ""
-
-        # valida dirección si es texto mixto
-        if address and not re.match(r"^0x[a-fA-F0-9]{6,}", str(address)):
-            # intenta extraer 0x...
-            m = re.search(r"0x[a-fA-F0-9]{6,}", str(address))
-            if m:
-                address = m.group(0)
-
-        rows.append(TopRow(
-            rank=0,
-            symbol=str(symbol) if symbol else "-",
-            side=str(side) if side else "-",
-            size_usd_text=size_txt or format_amount(size_val),
-            size_usd_num=float(size_val),
-            owner=str(owner) if owner else "",
-            address=str(address) if address else "",
-        ))
-    return rows
-
-async def fetch_hyperdash_top() -> List[TopRow]:
-    """Intenta extraer el Top 20 desde Hyperdash con varias estrategias y logs."""
-    def dlog(*a):
-        if os.getenv("DEBUG") == "1":
-            logger.info("DEBUG " + " ".join(str(x) for x in a))
-
-    await ensure_chromium_installed()
+async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
+    """
+    Abre https://hyperdash.info/top-traders y extrae las primeras 20 filas
+    ordenadas por 'Main Position'. La página es SPA, así que:
+      - Esperamos 'networkidle'
+      - Si no vemos tabla visible, leemos el state del DOM con evaluate()
+    Devuelve: lista de dicts con: rank, wallet, main_position, side (Long/Short), symbol
+    """
     from playwright.async_api import async_playwright
+
+    url = "https://hyperdash.info/top-traders?sort=main_position"
+
+    # Playwright
+    exe = chromium_executable()
+    if exe:
+        log.info(f"Chromium ya está en: {exe}")
+    else:
+        log.warning("No se encontró ruta fija de Chromium; Playwright usará su bin por defecto.")
+
+    rows: List[Dict[str, Any]] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-gpu",
-            ],
+            executable_path=exe, headless=True, args=["--no-sandbox"]
         )
-        ctx = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"),
-            locale="en-US",
-            timezone_id="UTC",
-        )
-        await ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-        """)
-        page = await ctx.new_page()
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 900},
+            )
+            # Bloquea recursos pesados
+            await context.route("**/*", lambda route: (
+                route.abort() if route.request.resource_type in {"image", "media", "font"} else route.continue_()
+            ))
 
-        captured_json: List[Dict[str, Any]] = []
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            # Deja que la SPA renderice
+            await page.wait_for_load_state("networkidle", timeout=60_000)
 
-        def is_json_like(resp) -> bool:
+            # 1) Primer intento: hay <table> visible
             try:
-                ct = (resp.headers or {}).get("content-type", "")
+                await page.wait_for_selector("table", timeout=30_000, state="visible")
+                # Algunas tablas son virtualizadas, pero probamos:
+                trhandles = await page.locator("table tbody tr").all()
+                if trhandles:
+                    for i, tr in enumerate(trhandles[:30]):  # tomamos un poco más por si hay headers
+                        tds = await tr.locator("td").all_inner_texts()
+                        if len(tds) < 3:
+                            continue
+                        # La estructura exacta puede cambiar; intentamos heurísticas:
+                        # Suelen estar: rank / wallet / ... / main position / side / symbol ...
+                        text_line = " | ".join(tds)
+                        # Busca la wallet (0x...)
+                        m_wallet = re.search(r"(0x[a-fA-F0-9]{40})", text_line)
+                        wallet = m_wallet.group(1) if m_wallet else tds[1].strip()
+
+                        # Main Position: algo como $139.86M
+                        m_mp = re.search(r"\$[0-9\.\,]+[KMB]?", text_line)
+                        main_pos = m_mp.group(0) if m_mp else tds[-1].strip()
+
+                        # Side & symbol si se ven
+                        side = "Long" if "Long" in text_line else ("Short" if "Short" in text_line else "?")
+                        m_sym = re.search(r"\b[A-Z]{3,5}\b", text_line)
+                        symbol = m_sym.group(0) if m_sym else "?"
+
+                        rows.append({
+                            "rank": i + 1,
+                            "wallet": wallet,
+                            "main_position": main_pos,
+                            "side": side,
+                            "symbol": symbol,
+                        })
+
             except Exception:
-                ct = ""
-            return "application/json" in ct or resp.url.endswith(".json")
+                # 2) Fallback: leer del DOM con evaluate (páginas con listas virtualizadas)
+                dom_rows = await page.evaluate("""
+                () => {
+                  const out = [];
+                  // Busca cualquier nodo que parezca fila con wallet y "Main Position"
+                  // Esto es heurístico para cambios de UI.
+                  const rows = Array.from(document.querySelectorAll("tr, [role='row']"));
+                  for (const [idx, r] of rows.entries()) {
+                    const txt = r.innerText || "";
+                    if (!txt) continue;
+                    if (!/0x[a-fA-F0-9]{40}/.test(txt)) continue;
+                    const mWallet = txt.match(/0x[a-fA-F0-9]{40}/);
+                    const mMP = txt.match(/\\$[0-9\\.,]+[KMB]?/);
+                    const mSide = txt.match(/Long|Short/);
+                    const mSym = txt.match(/\\b[A-Z]{3,5}\\b/);
+                    out.push({
+                      rank: idx + 1,
+                      wallet: mWallet ? mWallet[0] : "",
+                      main_position: mMP ? mMP[0] : "",
+                      side: mSide ? mSide[0] : "?",
+                      symbol: mSym ? mSym[0] : "?"
+                    });
+                  }
+                  return out.slice(0, 30);
+                }
+                """)
+                for i, r in enumerate(dom_rows):
+                    r["rank"] = i + 1
+                    rows.append(r)
 
-        async def on_response(resp):
-            if is_json_like(resp):
+            # Limpia, ordena y top 20
+            def mp_value(s: str) -> float:
+                s = s.replace("$", "").replace(",", "").upper()
+                mult = 1.0
+                if s.endswith("K"): mult, s = 1_000, s[:-1]
+                elif s.endswith("M"): mult, s = 1_000_000, s[:-1]
+                elif s.endswith("B"): mult, s = 1_000_000_000, s[:-1]
                 try:
-                    data = await resp.json()
-                    size = len(json.dumps(data)) if data is not None else 0
-                    dlog(f"JSON url={resp.url} size≈{size}")
-                    captured_json.append({"url": resp.url, "data": data})
-                except Exception as e:
-                    dlog(f"JSON parse fail url={resp.url} err={e!r}")
+                    return float(s) * mult
+                except Exception:
+                    return 0.0
 
-        page.on("response", on_response)
+            # quita filas incompletas y ordena por main_position
+            cleaned = [
+                r for r in rows
+                if r.get("wallet") and r.get("main_position")
+            ]
+            # Puede que la UI ya venga ordenada; igual lo re-ordenamos
+            cleaned.sort(key=lambda r: mp_value(r["main_position"]), reverse=True)
+            top20 = cleaned[:20]
 
-        await page.goto(HYPERDASH_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(1000)
+            # Rerank
+            for i, r in enumerate(top20):
+                r["rank"] = i + 1
+                r["main_position"] = format_money(r["main_position"])
 
-        # -------- A) __NEXT_DATA__ y otros scripts JSON --------
-        try:
-            # Next.js
-            script = page.locator("script#__NEXT_DATA__")
-            if await script.count() > 0:
-                raw = await script.first.inner_text()
-                j = json.loads(raw)
-                dlog(f"NEXT_DATA bytes={len(raw)}")
-                rows = extract_candidates_from_json(j)
-                if rows:
-                    rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
-                    for i, r in enumerate(rows[:20], start=1):
-                        r.rank = i
-                    await ctx.close(); await browser.close()
-                    return rows[:20]
-        except Exception as e:
-            dlog(f"NEXT_DATA error {e!r}")
+            return top20
 
-        # Otros <script type="application/json"> típicos (Nuxt/Remix/etc)
-        try:
-            scripts = page.locator("script[type='application/json']")
-            sc = await scripts.count()
-            dlog(f"script[type=application/json] count={sc}")
-            for i in range(min(sc, 12)):  # límite por seguridad
-                raw = (await scripts.nth(i).inner_text()) or ""
-                if raw.strip().startswith("{") or raw.strip().startswith("["):
-                    j = json.loads(raw)
-                    rows = extract_candidates_from_json(j)
-                    if rows:
-                        rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
-                        for k, r in enumerate(rows[:20], start=1):
-                            r.rank = k
-                        await ctx.close(); await browser.close()
-                        return rows[:20]
-        except Exception as e:
-            dlog(f"script[json] error {e!r}")
+        finally:
+            await browser.close()
 
-        # -------- B) Respuestas XHR/JSON capturadas --------
-        try:
-            await page.wait_for_timeout(1500)  # margen para últimos XHR
-            dlog(f"captured_json count={len(captured_json)}")
-            combined: List[TopRow] = []
-            for blob in captured_json:
-                combined.extend(extract_candidates_from_json(blob["data"]))
-            if combined:
-                combined.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
-                for i, r in enumerate(combined[:20], start=1):
-                    r.rank = i
-                await ctx.close(); await browser.close()
-                return combined[:20]
-        except Exception as e:
-            dlog(f"XHR parse error {e!r}")
 
-        # -------- C) Fallback DOM (si hay) --------
-        rows: List[TopRow] = []
-        try:
-            # cualquier elemento que parezca grilla/tabla
-            await page.wait_for_selector("table, [role='table'], [data-radix-scroll-area-viewport]", timeout=8000)
-        except Exception:
-            pass
-
-        try:
-            trs = page.locator("table >> tbody >> tr")
-            if await trs.count() == 0:
-                trs = page.locator("table tr")
-            rc = await trs.count()
-            dlog(f"DOM rows={rc}")
-            for i in range(rc):
-                tds = trs.nth(i).locator("td")
-                c = await tds.count()
-                texts = [(await tds.nth(k).inner_text() or "").strip() for k in range(c)]
-                if not texts:
-                    continue
-                size_txt = ""
-                for t in texts:
-                    if "$" in t and re.search(r"\$\s*\d", t):
-                        size_txt = t; break
-                size_num = usd_to_float(size_txt)
-                if size_num == 0:
-                    continue
-                symbol = "-"
-                for t in texts:
-                    if re.fullmatch(r"[A-Z0-9:\-\.]{2,12}", t.replace("PERP","").replace(" ","")):
-                        symbol = t; break
-                if symbol == "-" and texts:
-                    symbol = texts[0]
-                side = guess_side(texts)
-                addr = find_first_addr(texts)
-                rows.append(TopRow(
-                    rank=0, symbol=symbol, side=side,
-                    size_usd_text=size_txt or format_amount(size_num),
-                    size_usd_num=size_num, owner="", address=addr
-                ))
-        except Exception as e:
-            dlog(f"DOM parse error {e!r}")
-
-        # -------- D) Último recurso: trocear body.innerText --------
-        if not rows:
-            body_text = await page.evaluate("document.body.innerText || ''")
-            dlog(f"body chars={len(body_text)}")
-            for ln in (ln.strip() for ln in body_text.splitlines() if "$" in ln):
-                size_num = usd_to_float(ln)
-                if size_num == 0:
-                    continue
-                side = guess_side([ln])
-                m_sym = re.search(r"\b[A-Z]{2,10}\b", ln)
-                symbol = m_sym.group(0) if m_sym else "-"
-                addr = find_first_addr([ln])
-                rows.append(TopRow(
-                    rank=0, symbol=symbol, side=side,
-                    size_usd_text=ln, size_usd_num=size_num,
-                    owner="", address=addr
-                ))
-
-        await ctx.close(); await browser.close()
-
-        rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
-        for i, r in enumerate(rows[:20], start=1):
-            r.rank = i
-        return rows[:20]
-
-def format_top_markdown(rows: List[TopRow]) -> str:
+def build_top_message(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "_No se pudieron extraer filas (la página no devolvió datos visibles)._"
-    lines = [
-        "*Top 20 — Main Position ($) — Hyperdash*",
-        f"_Fuente: {HYPERDASH_URL}_",
-        "",
-        "Rank | Side | Size (USD) | Symbol | Owner/Addr",
-        ":--: | :--- | ----------: | :----- | :--------",
-    ]
+        return "No se pudieron extraer filas (la página no devolvió datos visibles)."
+    lines = []
     for r in rows:
-        who = r.owner or r.address or "-"
-        lines.append(f"{r.rank} | {r.side} | {r.size_usd_text} | {r.symbol} | {who}")
+        lines.append(
+            f"*#{r['rank']} — {r['wallet']}*  —  {r.get('side','?')} {r.get('symbol','?')}\n"
+            f"`{r['main_position']}`"
+        )
+    return "\n\n".join(lines)
+
+# ---------- /wallet usando API pública de Hyperliquid (mejor que scrape) ----------
+
+HL_API = "https://api.hyperliquid.xyz/info"
+
+async def query_trader_state(user_addr: str) -> Optional[Dict[str, Any]]:
+    """
+    Llama al endpoint público para traderState (si cambiara, ver logs DEBUG).
+    """
+    params = {"type": "traderState", "user": user_addr}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(HL_API, params=params)
+        r.raise_for_status()
+        data = r.json()
+        # La forma exacta puede variar. Devolvemos el json crudo.
+        return data
+
+def summarize_wallet(data: Dict[str, Any], addr: str) -> str:
+    """
+    Hace un resumen legible de posiciones abiertas y algunas métricas si existen.
+    (El formato real del response puede cambiar; por eso hay 'get' defensivos).
+    """
+    if not data:
+        return "❓ No se recibió información de la wallet."
+
+    lines = [f"🔎 *Wallet consultada:*\n`{addr}`"]
+
+    # Intento de campos comunes (ajusta si ves cambios en DEBUG=1)
+    positions = data.get("assetPositions") or data.get("openPositions") or data.get("positions") or []
+    if not isinstance(positions, list):
+        positions = []
+
+    if positions:
+        lines.append("\n*Posiciones activas:*")
+        for p in positions[:10]:
+            sym = p.get("asset") or p.get("symbol") or "?"
+            szi = p.get("szi") or p.get("size") or "?"
+            px = p.get("px") or p.get("entryPx") or p.get("entry") or "?"
+            pv = p.get("positionValue") or p.get("pv") or "?"
+            roe = p.get("roe") or p.get("ROE") or p.get("unrealizedPnlPct") or "?"
+            pv_fmt = format_money(str(pv))
+            lines.append(f"• {sym}: szi={szi} pv={pv_fmt} entry={px} ROE={roe}")
+    else:
+        lines.append("\nNo se encontraron posiciones abiertas en la respuesta.")
+
+    # Últimos fills si vinieran en el payload
+    fills = data.get("fills24h") or data.get("fills") or []
+    if isinstance(fills, list) and fills:
+        lines.append("\n*Fills 24h (top 5):*")
+        for f in fills[:5]:
+            # Campos típicos
+            sym = f.get("symbol") or f.get("asset") or "?"
+            q = f.get("qty") or f.get("sz") or "?"
+            px = f.get("px") or f.get("price") or "?"
+            ts = f.get("time") or f.get("timestamp") or ""
+            emoji = "🔴" if str(f.get("side","")).lower().startswith("sell") else "🟢"
+            lines.append(f"{emoji} {sym} {q}@{px} {ts}")
+
     return "\n".join(lines)
 
-# ----------------- Telegram handlers -----------------
+# ---------- Handlers de Telegram ----------
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
+    txt = (
         "👋 Hola! Soy el bot de *Hyperliquid Top*.\n\n"
-        "Comandos:\n"
-        "• /top — Muestra el Top 20 por *Main Position* ($)\n"
-        "• /wallet <address> — (opcional) datos de wallet\n\n"
-        "Este bot puede publicar cada 15 min si configuras BROADCAST_CHAT_ID."
+        "*Comandos:*\n"
+        "• /top — Muestra el Top 20 por *Main Position ($)*\n"
+        "• /wallet `<address>` — (opcional) datos de wallet\n\n"
+        "Este bot puede publicar cada 15 min si configuras *BROADCAST_CHATID*."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.effective_message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         rows = await fetch_hyperdash_top()
-        msg = format_top_markdown(rows)
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        msg = build_top_message(rows)
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.exception("Fallo en /top")
-        await update.message.reply_text(
-            f"⚠️ Error al generar el Top: `{e}`\n"
-            "Si vuelve a fallar, inténtalo otra vez en 1-2 min.",
-            parse_mode=ParseMode.MARKDOWN
+        log.exception("Fallo en /top")
+        await update.effective_message.reply_text(
+            f"⚠️ Error al generar el Top: {e}\n\n"
+            "Call log:\n"
+            "si el error fue por timeout, reintenta en unos segundos.",
+            disable_web_page_preview=True,
         )
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Uso: `/wallet <address>`", parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text("Uso: `/wallet 0x...`", parse_mode=ParseMode.MARKDOWN)
         return
-    address = context.args[0]
-    await update.message.reply_text(
-        f"🔎 Wallet consultada: `{address}`\n(Implementa aquí tu lógica de wallet)",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-# ----------------- HTTP (webhook & healthz) -----------------
-async def handle_healthz(request: web.Request) -> web.Response:
-    return web.Response(text="ok")
-
-async def handle_webhook(request: web.Request) -> web.Response:
-    if WEBHOOK_SECRET and request.query.get("secret") != WEBHOOK_SECRET:
-        return web.Response(status=403, text="forbidden")
-    data = await request.json()
-    application: Application = request.app["tg_app"]
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return web.Response(text="ok")
-
-async def periodic_job(app: Application):
-    if not BROADCAST_CHAT_ID:
+    addr = context.args[0].strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", addr):
+        await update.effective_message.reply_text("Dirección no válida. Debe ser `0x...` (40 hex).",
+                                                  parse_mode=ParseMode.MARKDOWN)
         return
     try:
-        rows = await fetch_hyperdash_top()
-        msg = format_top_markdown(rows)
-        await app.bot.send_message(
-            chat_id=int(BROADCAST_CHAT_ID),
-            text=msg,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        logger.exception("Fallo en periodic_job")
+        data = await query_trader_state(addr)
+        if DEBUG:
+            log.debug("TraderState raw: %s", json.dumps(data)[:1000])
+        msg = summarize_wallet(data or {}, addr)
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.exception("Fallo en /wallet")
+        await update.effective_message.reply_text(f"⚠️ Error consultando wallet: {e}")
 
-async def on_startup(aio_app: web.Application):
-    await ensure_chromium_installed()
-    tg_app: Application = await create_tg_app()
-    await tg_app.initialize()
-    await tg_app.start()
+# (Opcional) suscripción simple: cada 15 min manda el /top al chat configurado
+_subscribers = set()
 
-    if PUBLIC_URL:
-        url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    _subscribers.add(chat_id)
+    await update.message.reply_text("✅ Suscrito a reportes cada 15 min en este chat.")
+
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    _subscribers.discard(chat_id)
+    await update.message.reply_text("🛑 Suscripción detenida para este chat.")
+
+async def periodic_job(app: Application):
+    # Si prefieres forzar sólo BROADCAST_CHATID, comenta la parte de _subscribers.
+    while True:
         try:
-            await tg_app.bot.set_webhook(url=url)
-            logger.info("Webhook seteado: %s", url)
+            rows = await fetch_hyperdash_top()
+            msg = build_top_message(rows)
+            targets = set(_subscribers)
+            if BROADCAST_CHATID:
+                targets.add(int(BROADCAST_CHATID))
+            for chat_id in targets:
+                try:
+                    await app.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+                except Exception:
+                    log.exception("Error enviando broadcast a %s", chat_id)
         except Exception:
-            logger.exception("No se pudo setear webhook")
+            log.exception("Fallo en periodic_job")
+        await asyncio.sleep(15 * 60)
 
-    aio_app["tg_app"] = tg_app
+# ---------- AioHTTP Webhook App ----------
 
-    if BROADCAST_CHAT_ID:
-        tg_app.job_queue.run_repeating(
-            lambda ctx: asyncio.create_task(periodic_job(tg_app)),
-            interval=PUSH_EVERY_SECONDS,
-            first=10,
-        )
+async def handle_healthz(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "hyperliquid-top20-bot"})
 
-async def on_cleanup(aio_app: web.Application):
-    tg_app: Application = aio_app.get("tg_app")
-    if tg_app:
-        await tg_app.stop()
-        await tg_app.shutdown()
+async def handle_webhook(request: web.Request) -> web.Response:
+    # Validación simple de secret
+    if request.query.get("secret") != WEBHOOK_SECRET:
+        return web.json_response({"ok": False, "error": "bad secret"}, status=403)
+    data = await request.json()
+    # Pasamos el update a PTB
+    update = Update.de_json(data=data, bot=request.app["tg_app"].bot)
+    await request.app["tg_app"].process_update(update)
+    return web.json_response({"ok": True})
+
+async def on_startup(app: web.Application) -> None:
+    # Set webhook de Telegram apuntando a este servicio
+    webhook_url = f"{BASE_URL}/webhook?secret={WEBHOOK_SECRET}"
+    await app["tg_app"].bot.set_webhook(url=webhook_url)
+    log.info("Webhook set -> %s", webhook_url)
+
+async def on_cleanup(app: web.Application) -> None:
+    await app["tg_app"].shutdown()
+    await app["tg_app"].stop()
+    log.info("Telegram Application stopped")
 
 def build_web_app() -> web.Application:
-    aio_app = web.Application()
-    aio_app.router.add_get("/healthz", handle_healthz)
-    aio_app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    aio_app.on_startup.append(on_startup)
-    aio_app.on_cleanup.append(on_cleanup)
-    return aio_app
+    tg_app = Application.builder().token(BOT_TOKEN).build()
 
-async def create_tg_app() -> Application:
-    if not TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("top", cmd_top))
-    app.add_handler(CommandHandler("top20", cmd_top))
-    app.add_handler(CommandHandler("wallet", cmd_wallet))
-    return app
+    # Handlers
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("top", cmd_top))
+    tg_app.add_handler(CommandHandler("wallet", cmd_wallet))
+    tg_app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    tg_app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+
+    # Lanza tarea periódica
+    asyncio.get_event_loop().create_task(periodic_job(tg_app))
+
+    web_app = web.Application()
+    web_app["tg_app"] = tg_app
+    web_app.router.add_get("/healthz", handle_healthz)
+    web_app.router.add_post("/webhook", handle_webhook)
+
+    web_app.on_startup.append(on_startup)
+    web_app.on_cleanup.append(on_cleanup)
+    return web_app
+
+def main():
+    app = build_web_app()
+    web.run_app(app, host=HOST, port=PORT)
 
 if __name__ == "__main__":
-    web.run_app(build_web_app(), host="0.0.0.0", port=PORT)
+    main()
