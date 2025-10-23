@@ -209,7 +209,13 @@ def extract_candidates_from_json(j: Any) -> List[TopRow]:
     return rows
 
 async def fetch_hyperdash_top() -> List[TopRow]:
+    """Intenta extraer el Top 20 desde Hyperdash con varias estrategias y logs."""
+    def dlog(*a):
+        if os.getenv("DEBUG") == "1":
+            logger.info("DEBUG " + " ".join(str(x) for x in a))
+
     await ensure_chromium_installed()
+    from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -221,7 +227,6 @@ async def fetch_hyperdash_top() -> List[TopRow]:
                 "--disable-gpu",
             ],
         )
-
         ctx = await browser.new_context(
             viewport={"width": 1440, "height": 900},
             user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -230,48 +235,47 @@ async def fetch_hyperdash_top() -> List[TopRow]:
             locale="en-US",
             timezone_id="UTC",
         )
-
-        # Quitar navigator.webdriver y pequeños fingerprints
         await ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
         """)
-
         page = await ctx.new_page()
 
         captured_json: List[Dict[str, Any]] = []
 
         def is_json_like(resp) -> bool:
             try:
-                ct = resp.headers.get("content-type", "")
+                ct = (resp.headers or {}).get("content-type", "")
             except Exception:
                 ct = ""
             return "application/json" in ct or resp.url.endswith(".json")
 
         async def on_response(resp):
-            # Captura respuestas JSON que puedan traer la data
             if is_json_like(resp):
                 try:
                     data = await resp.json()
+                    size = len(json.dumps(data)) if data is not None else 0
+                    dlog(f"JSON url={resp.url} size≈{size}")
                     captured_json.append({"url": resp.url, "data": data})
-                except Exception:
-                    pass
+                except Exception as e:
+                    dlog(f"JSON parse fail url={resp.url} err={e!r}")
 
         page.on("response", on_response)
 
         await page.goto(HYPERDASH_URL, wait_until="domcontentloaded")
-        # da tiempo a XHRs
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1000)
 
-        # -------- Estrategia A: __NEXT_DATA__ --------
+        # -------- A) __NEXT_DATA__ y otros scripts JSON --------
         try:
+            # Next.js
             script = page.locator("script#__NEXT_DATA__")
             if await script.count() > 0:
                 raw = await script.first.inner_text()
                 j = json.loads(raw)
+                dlog(f"NEXT_DATA bytes={len(raw)}")
                 rows = extract_candidates_from_json(j)
                 if rows:
                     rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
@@ -279,13 +283,32 @@ async def fetch_hyperdash_top() -> List[TopRow]:
                         r.rank = i
                     await ctx.close(); await browser.close()
                     return rows[:20]
-        except Exception:
-            pass
+        except Exception as e:
+            dlog(f"NEXT_DATA error {e!r}")
 
-        # -------- Estrategia B: respuestas JSON capturadas --------
+        # Otros <script type="application/json"> típicos (Nuxt/Remix/etc)
         try:
-            # espera corta adicional por si siguen llegando XHR
-            await page.wait_for_timeout(1500)
+            scripts = page.locator("script[type='application/json']")
+            sc = await scripts.count()
+            dlog(f"script[type=application/json] count={sc}")
+            for i in range(min(sc, 12)):  # límite por seguridad
+                raw = (await scripts.nth(i).inner_text()) or ""
+                if raw.strip().startswith("{") or raw.strip().startswith("["):
+                    j = json.loads(raw)
+                    rows = extract_candidates_from_json(j)
+                    if rows:
+                        rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
+                        for k, r in enumerate(rows[:20], start=1):
+                            r.rank = k
+                        await ctx.close(); await browser.close()
+                        return rows[:20]
+        except Exception as e:
+            dlog(f"script[json] error {e!r}")
+
+        # -------- B) Respuestas XHR/JSON capturadas --------
+        try:
+            await page.wait_for_timeout(1500)  # margen para últimos XHR
+            dlog(f"captured_json count={len(captured_json)}")
             combined: List[TopRow] = []
             for blob in captured_json:
                 combined.extend(extract_candidates_from_json(blob["data"]))
@@ -295,75 +318,61 @@ async def fetch_hyperdash_top() -> List[TopRow]:
                     r.rank = i
                 await ctx.close(); await browser.close()
                 return combined[:20]
-        except Exception:
-            pass
+        except Exception as e:
+            dlog(f"XHR parse error {e!r}")
 
-        # -------- Estrategia C: Fallback DOM (tabla o grid) --------
+        # -------- C) Fallback DOM (si hay) --------
         rows: List[TopRow] = []
         try:
-            # intenta cualquier fila (tabla tradicional)
-            await page.wait_for_selector("table, [role='table'], [data-radix-scroll-area-viewport]", timeout=15000)
+            # cualquier elemento que parezca grilla/tabla
+            await page.wait_for_selector("table, [role='table'], [data-radix-scroll-area-viewport]", timeout=8000)
         except Exception:
-            # no hay elementos “visibles” marcados como tabla; intenta parsear todo el innerText
             pass
 
-        # 1) tabla clásica
         try:
             trs = page.locator("table >> tbody >> tr")
             if await trs.count() == 0:
                 trs = page.locator("table tr")
             rc = await trs.count()
+            dlog(f"DOM rows={rc}")
             for i in range(rc):
                 tds = trs.nth(i).locator("td")
                 c = await tds.count()
                 texts = [(await tds.nth(k).inner_text() or "").strip() for k in range(c)]
                 if not texts:
                     continue
-
-                # monto $ por heurística
                 size_txt = ""
                 for t in texts:
                     if "$" in t and re.search(r"\$\s*\d", t):
-                        size_txt = t
-                        break
+                        size_txt = t; break
                 size_num = usd_to_float(size_txt)
                 if size_num == 0:
                     continue
-
-                # símbolo y lado
                 symbol = "-"
                 for t in texts:
-                    if re.fullmatch(r"[A-Z0-9:\-\.]{2,12}", t.replace("PERP", "").replace(" ", "")):
-                        symbol = t
-                        break
+                    if re.fullmatch(r"[A-Z0-9:\-\.]{2,12}", t.replace("PERP","").replace(" ","")):
+                        symbol = t; break
                 if symbol == "-" and texts:
                     symbol = texts[0]
                 side = guess_side(texts)
-
                 addr = find_first_addr(texts)
-                owner = ""
-
                 rows.append(TopRow(
                     rank=0, symbol=symbol, side=side,
                     size_usd_text=size_txt or format_amount(size_num),
-                    size_usd_num=size_num, owner=owner, address=addr
+                    size_usd_num=size_num, owner="", address=addr
                 ))
-        except Exception:
-            pass
+        except Exception as e:
+            dlog(f"DOM parse error {e!r}")
 
-        # 2) si no hubo tabla, intenta trocear body.innerText
+        # -------- D) Último recurso: trocear body.innerText --------
         if not rows:
             body_text = await page.evaluate("document.body.innerText || ''")
-            # líneas candidatas que tengan $ grande
-            lines = [ln.strip() for ln in body_text.splitlines() if "$" in ln]
-            # agrupa en bloques de 3-6 líneas
-            for ln in lines:
+            dlog(f"body chars={len(body_text)}")
+            for ln in (ln.strip() for ln in body_text.splitlines() if "$" in ln):
                 size_num = usd_to_float(ln)
                 if size_num == 0:
                     continue
-                # busca símbolos/side alrededor con heurística simple (no perfecto)
                 side = guess_side([ln])
-                # símbolo: palabra en MAYÚSCULAS corta
                 m_sym = re.search(r"\b[A-Z]{2,10}\b", ln)
                 symbol = m_sym.group(0) if m_sym else "-"
                 addr = find_first_addr([ln])
@@ -373,8 +382,7 @@ async def fetch_hyperdash_top() -> List[TopRow]:
                     owner="", address=addr
                 ))
 
-        await ctx.close()
-        await browser.close()
+        await ctx.close(); await browser.close()
 
         rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
         for i, r in enumerate(rows[:20], start=1):
