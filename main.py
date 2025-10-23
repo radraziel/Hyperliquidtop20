@@ -2,25 +2,18 @@
 import os
 import re
 import sys
+import json
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
 
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-# =========================
-# Config & Logging
-# =========================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
@@ -28,54 +21,22 @@ logging.basicConfig(
 logger = logging.getLogger("hyperliquid-top20-bot")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "")         # p.ej. https://hyperliquidtop20.onrender.com
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "")
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hlhook")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Opcional: broadcast automático cada 15 min
-BROADCAST_CHAT_ID = os.environ.get("BROADCAST_CHAT_ID")  # chat_id numérico (str)
+BROADCAST_CHAT_ID = os.environ.get("BROADCAST_CHAT_ID")
 PUSH_EVERY_SECONDS = int(os.environ.get("PUSH_EVERY_SECONDS", "900"))
 
-# Playwright cache local en el proyecto
 PLAYWRIGHT_BROWSERS_PATH = os.environ.get(
-    "PLAYWRIGHT_BROWSERS_PATH",
-    "/opt/render/project/src/.playwright"
+    "PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.playwright"
 )
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_PATH
 
-# =========================
-# Asegurar Chromium en runtime (por si Render pierde caché)
-# =========================
-async def ensure_chromium_installed() -> None:
-    browsers_path = Path(PLAYWRIGHT_BROWSERS_PATH)
-    chrome_bin = None
-    if browsers_path.exists():
-        for p in browsers_path.rglob("chrome-linux/chrome"):
-            if p.exists():
-                chrome_bin = p
-                break
-    if chrome_bin:
-        logger.info("Chromium ya está en: %s", chrome_bin)
-        return
-
-    logger.info("Chromium no encontrado. Instalando con 'python -m playwright install chromium'...")
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "playwright", "install", "chromium",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    logger.info("Salida de playwright install:\n%s", out.decode(errors="ignore"))
-    if proc.returncode != 0:
-        raise RuntimeError("No se pudo instalar Chromium en runtime.")
-
-# =========================
-# Scraper Hyperdash Top Traders (sin depender de “Main Position” visible)
-# =========================
-from playwright.async_api import async_playwright
-
 HYPERDASH_URL = "https://hyperdash.info/top-traders"
 
+# ----------------------- Utils -----------------------
 @dataclass
 class TopRow:
     rank: int
@@ -89,171 +50,342 @@ class TopRow:
 MULTS = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 def usd_to_float(s: str) -> float:
-    """
-    Convierte textos como '$139.86M' / '$1,234,567' / '$2.5B' a número float en USD.
-    Si falla, devuelve 0.0
-    """
     if not s:
         return 0.0
     txt = s.strip().upper().replace(",", "")
-    # extrae multiplicador (K/M/B) si existe al final
     mult = 1.0
     m = re.search(r"([KMB])\b", txt)
     if m:
         mult = MULTS.get(m.group(1), 1.0)
-    # extrae número principal con signo
-    n = re.search(r"-?\$?(\d+(\.\d+)?)", txt)
+    n = re.search(r"-?\$?\s*(\d+(\.\d+)?)", txt)
     if not n:
         return 0.0
-    val = float(n.group(1)) * mult
-    return val
+    return float(n.group(1)) * mult
 
-def guess_side(texts: List[str]) -> str:
-    joined = " ".join(texts).lower()
+def format_amount(n: float) -> str:
+    n = float(n)
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000:
+        return f"{sign}${n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{sign}${n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{sign}${n/1_000:.2f}K"
+    return f"{sign}${n:,.0f}"
+
+def guess_side(texts: Iterable[str]) -> str:
+    joined = " ".join([t.lower() for t in texts if t])
     if "short" in joined:
         return "short"
     if "long" in joined:
         return "long"
     return "-"
 
-def first_address(texts: List[str]) -> str:
+def find_first_addr(texts: Iterable[str]) -> str:
     for t in texts:
+        if not t:
+            continue
         m = re.search(r"0x[a-fA-F0-9]{6,}", t)
         if m:
             return m.group(0)
     return ""
 
+# ----------------- Playwright bootstrap -----------------
+async def ensure_chromium_installed() -> None:
+    from pathlib import Path
+    browsers_path = Path(PLAYWRIGHT_BROWSERS_PATH)
+    chrome = None
+    if browsers_path.exists():
+        for p in browsers_path.rglob("chrome-linux/chrome"):
+            chrome = p
+            break
+    if chrome:
+        logger.info("Chromium ya está en: %s", chrome)
+        return
+
+    logger.info("Chromium no encontrado. Instalando en runtime…")
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "playwright", "install", "chromium",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    logger.info("Salida install:\n%s", out.decode(errors="ignore"))
+    if proc.returncode != 0:
+        raise RuntimeError("No se pudo instalar Chromium.")
+
+# ----------------- Scraper robusto -----------------
+from playwright.async_api import async_playwright
+
+def walk_json(node: Any) -> Iterable[Any]:
+    """Recorre un JSON anidado y rinde todos los dict/list internos."""
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from walk_json(v)
+    elif isinstance(node, list):
+        for x in node:
+            yield from walk_json(x)
+
+def extract_candidates_from_json(j: Any) -> List[TopRow]:
+    """
+    Busca objetos que parezcan filas: que tengan monto en USD, símbolo, etc.
+    Heurística genérica para adaptarnos a cambios.
+    """
+    rows: List[TopRow] = []
+    for obj in walk_json(j):
+        if not isinstance(obj, dict):
+            continue
+
+        # posibles llaves de USD/texto
+        usd_fields = [
+            "mainPosition", "main_position", "positionUsd", "mainUsd", "usd",
+            "notionalUsd", "pv", "sizeUsd", "valueUsd"
+        ]
+        text_fields = [
+            "mainPositionText", "main_position_text", "positionUsdText",
+            "sizeUsdText", "pvText", "valueText"
+        ]
+
+        size_val: Optional[float] = None
+        size_txt: Optional[str] = None
+
+        # intenta numérica primero
+        for k in usd_fields:
+            if k in obj and isinstance(obj[k], (int, float, str)):
+                if isinstance(obj[k], str):
+                    size_val = usd_to_float(obj[k])
+                    size_txt = obj[k]
+                else:
+                    size_val = float(obj[k])
+                    size_txt = format_amount(size_val)
+                break
+
+        # si no, intenta textual que traiga $
+        if size_val is None:
+            for k in text_fields:
+                if k in obj and isinstance(obj[k], str) and "$" in obj[k]:
+                    size_txt = obj[k]
+                    size_val = usd_to_float(obj[k])
+                    break
+
+        if size_val is None or size_val == 0:
+            continue
+
+        # símbolo / par
+        symbol = obj.get("symbol") or obj.get("asset") or obj.get("pair") or "-"
+        if isinstance(symbol, dict):
+            symbol = symbol.get("name") or symbol.get("symbol") or "-"
+
+        # lado
+        side = obj.get("side") or obj.get("positionSide") or "-"
+        if isinstance(side, dict):
+            side = side.get("name") or "-"
+
+        # owner/address
+        owner = obj.get("owner") or obj.get("name") or ""
+        address = (
+            obj.get("address") or obj.get("wallet") or obj.get("trader") or ""
+        )
+        if isinstance(address, dict):
+            address = address.get("address") or address.get("id") or ""
+
+        # valida dirección si es texto mixto
+        if address and not re.match(r"^0x[a-fA-F0-9]{6,}", str(address)):
+            # intenta extraer 0x...
+            m = re.search(r"0x[a-fA-F0-9]{6,}", str(address))
+            if m:
+                address = m.group(0)
+
+        rows.append(TopRow(
+            rank=0,
+            symbol=str(symbol) if symbol else "-",
+            side=str(side) if side else "-",
+            size_usd_text=size_txt or format_amount(size_val),
+            size_usd_num=float(size_val),
+            owner=str(owner) if owner else "",
+            address=str(address) if address else "",
+        ))
+    return rows
+
 async def fetch_hyperdash_top() -> List[TopRow]:
-    """
-    Carga la página, espera la tabla, detecta la columna de dinero, parsea todas las filas,
-    ordena por tamaño USD (desc) y devuelve Top 20.
-    """
     await ensure_chromium_installed()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = await browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+            ],
         )
+
+        ctx = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"),
+            locale="en-US",
+            timezone_id="UTC",
+        )
+
+        # Quitar navigator.webdriver y pequeños fingerprints
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        """)
+
         page = await ctx.new_page()
+
+        captured_json: List[Dict[str, Any]] = []
+
+        def is_json_like(resp) -> bool:
+            try:
+                ct = resp.headers.get("content-type", "")
+            except Exception:
+                ct = ""
+            return "application/json" in ct or resp.url.endswith(".json")
+
+        async def on_response(resp):
+            # Captura respuestas JSON que puedan traer la data
+            if is_json_like(resp):
+                try:
+                    data = await resp.json()
+                    captured_json.append({"url": resp.url, "data": data})
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
         await page.goto(HYPERDASH_URL, wait_until="domcontentloaded")
+        # da tiempo a XHRs
         await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(1500)
 
-        # Espera a que haya alguna tabla/filas (algunos renders tardan)
-        await page.wait_for_selector("table", timeout=30000)
-        # multiples frameworks usan roles; probamos primero tbody > tr
-        rows_loc = page.locator("table >> tbody >> tr")
-        # fallback si no hay tbody explícito
-        if await rows_loc.count() == 0:
-            rows_loc = page.locator("table tr")
+        # -------- Estrategia A: __NEXT_DATA__ --------
+        try:
+            script = page.locator("script#__NEXT_DATA__")
+            if await script.count() > 0:
+                raw = await script.first.inner_text()
+                j = json.loads(raw)
+                rows = extract_candidates_from_json(j)
+                if rows:
+                    rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
+                    for i, r in enumerate(rows[:20], start=1):
+                        r.rank = i
+                    await ctx.close(); await browser.close()
+                    return rows[:20]
+        except Exception:
+            pass
 
-        # Intenta detectar encabezados para ubicar columnas
-        headers = []
-        ths = page.locator("table thead tr th")
-        th_count = await ths.count()
-        for i in range(th_count):
-            txt = (await ths.nth(i).text_content() or "").strip()
-            headers.append(txt)
+        # -------- Estrategia B: respuestas JSON capturadas --------
+        try:
+            # espera corta adicional por si siguen llegando XHR
+            await page.wait_for_timeout(1500)
+            combined: List[TopRow] = []
+            for blob in captured_json:
+                combined.extend(extract_candidates_from_json(blob["data"]))
+            if combined:
+                combined.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
+                for i, r in enumerate(combined[:20], start=1):
+                    r.rank = i
+                await ctx.close(); await browser.close()
+                return combined[:20]
+        except Exception:
+            pass
 
-        # Encuentra índice de columna “Main Position” si existe
-        idx_money: Optional[int] = None
-        if headers:
-            for i, h in enumerate(headers):
-                if re.search(r"main\s*position", (h or ""), re.I):
-                    idx_money = i
-                    break
+        # -------- Estrategia C: Fallback DOM (tabla o grid) --------
+        rows: List[TopRow] = []
+        try:
+            # intenta cualquier fila (tabla tradicional)
+            await page.wait_for_selector("table, [role='table'], [data-radix-scroll-area-viewport]", timeout=15000)
+        except Exception:
+            # no hay elementos “visibles” marcados como tabla; intenta parsear todo el innerText
+            pass
 
-        results: List[TopRow] = []
-        row_count = await rows_loc.count()
+        # 1) tabla clásica
+        try:
+            trs = page.locator("table >> tbody >> tr")
+            if await trs.count() == 0:
+                trs = page.locator("table tr")
+            rc = await trs.count()
+            for i in range(rc):
+                tds = trs.nth(i).locator("td")
+                c = await tds.count()
+                texts = [(await tds.nth(k).inner_text() or "").strip() for k in range(c)]
+                if not texts:
+                    continue
 
-        for i in range(row_count):
-            row = rows_loc.nth(i)
-            cols = row.locator("td")
-            c = await cols.count()
-            if c == 0:
-                # puede ser tabla sin tbody: en ese caso tr>td podría no estar; saltamos
-                continue
-
-            # Lee todos los textos de la fila (nos sirve para heurísticas)
-            texts = []
-            for k in range(c):
-                t = await cols.nth(k).inner_text()
-                texts.append((t or "").strip())
-
-            # Determina columna de dinero si no hay headers
-            money_text = ""
-            if idx_money is not None and idx_money < c:
-                money_text = texts[idx_money]
-            else:
-                # Heurística: primera celda que contenga un $ con dígitos
+                # monto $ por heurística
+                size_txt = ""
                 for t in texts:
                     if "$" in t and re.search(r"\$\s*\d", t):
-                        money_text = t
+                        size_txt = t
                         break
+                size_num = usd_to_float(size_txt)
+                if size_num == 0:
+                    continue
 
-            size_num = usd_to_float(money_text)
-            if size_num == 0.0:
-                # Si no hay valor $ claro, no consideramos esta fila
-                continue
-
-            # símbolo: heurística: primera celda con letras tipo ticker (A-Z/.:)
-            symbol = "-"
-            for t in texts:
-                if re.fullmatch(r"[A-Z0-9:\-\.]{2,10}", t.replace("PERP", "").replace(" ", "")):
-                    symbol = t
-                    break
-            # si no, toma col 0
-            if symbol == "-" and c > 0:
-                symbol = texts[0]
-
-            side = guess_side(texts)
-
-            # Owner / Address: intenta leer link 0x..., si no, heurística por texto
-            address = ""
-            try:
-                link = row.locator("a:has-text('0x')")
-                if await link.count() > 0:
-                    txt = await link.first.text_content()
-                    address = (txt or "").strip()
-            except Exception:
-                pass
-            if not address:
-                address = first_address(texts)
-
-            owner = ""
-            # si la tabla tiene una columna de “Owner” o similar, usa esa
-            if headers:
-                for i_h, h in enumerate(headers):
-                    if re.search(r"owner|trader|name", (h or ""), re.I) and i_h < c:
-                        owner = texts[i_h]
+                # símbolo y lado
+                symbol = "-"
+                for t in texts:
+                    if re.fullmatch(r"[A-Z0-9:\-\.]{2,12}", t.replace("PERP", "").replace(" ", "")):
+                        symbol = t
                         break
+                if symbol == "-" and texts:
+                    symbol = texts[0]
+                side = guess_side(texts)
 
-            results.append(TopRow(
-                rank=0,  # lo llenamos tras ordenar
-                symbol=symbol or "-",
-                side=side or "-",
-                size_usd_text=money_text or "-",
-                size_usd_num=size_num,
-                owner=owner or "",
-                address=address or "",
-            ))
+                addr = find_first_addr(texts)
+                owner = ""
+
+                rows.append(TopRow(
+                    rank=0, symbol=symbol, side=side,
+                    size_usd_text=size_txt or format_amount(size_num),
+                    size_usd_num=size_num, owner=owner, address=addr
+                ))
+        except Exception:
+            pass
+
+        # 2) si no hubo tabla, intenta trocear body.innerText
+        if not rows:
+            body_text = await page.evaluate("document.body.innerText || ''")
+            # líneas candidatas que tengan $ grande
+            lines = [ln.strip() for ln in body_text.splitlines() if "$" in ln]
+            # agrupa en bloques de 3-6 líneas
+            for ln in lines:
+                size_num = usd_to_float(ln)
+                if size_num == 0:
+                    continue
+                # busca símbolos/side alrededor con heurística simple (no perfecto)
+                side = guess_side([ln])
+                # símbolo: palabra en MAYÚSCULAS corta
+                m_sym = re.search(r"\b[A-Z]{2,10}\b", ln)
+                symbol = m_sym.group(0) if m_sym else "-"
+                addr = find_first_addr([ln])
+                rows.append(TopRow(
+                    rank=0, symbol=symbol, side=side,
+                    size_usd_text=ln, size_usd_num=size_num,
+                    owner="", address=addr
+                ))
 
         await ctx.close()
         await browser.close()
 
-        # Ordena por tamaño USD desc y toma top 20
-        results.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
-        for i, r in enumerate(results[:20], start=1):
+        rows.sort(key=lambda r: abs(r.size_usd_num), reverse=True)
+        for i, r in enumerate(rows[:20], start=1):
             r.rank = i
-        return results[:20]
+        return rows[:20]
 
 def format_top_markdown(rows: List[TopRow]) -> str:
     if not rows:
-        return "_No se encontraron filas en la tabla._"
+        return "_No se pudieron extraer filas (la página no devolvió datos visibles)._"
     lines = [
-        "*Top 20 – Main Position (estimado por $) — Hyperdash*",
+        "*Top 20 — Main Position ($) — Hyperdash*",
         f"_Fuente: {HYPERDASH_URL}_",
         "",
         "Rank | Side | Size (USD) | Symbol | Owner/Addr",
@@ -264,9 +396,7 @@ def format_top_markdown(rows: List[TopRow]) -> str:
         lines.append(f"{r.rank} | {r.side} | {r.size_usd_text} | {r.symbol} | {who}")
     return "\n".join(lines)
 
-# =========================
-# Telegram
-# =========================
+# ----------------- Telegram handlers -----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 Hola! Soy el bot de *Hyperliquid Top*.\n\n"
@@ -284,7 +414,11 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except Exception as e:
         logger.exception("Fallo en /top")
-        await update.message.reply_text(f"⚠️ Error al generar el Top: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"⚠️ Error al generar el Top: `{e}`\n"
+            "Si vuelve a fallar, inténtalo otra vez en 1-2 min.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -296,9 +430,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode=ParseMode.MARKDOWN
     )
 
-# =========================
-# Web (Webhook + Healthz)
-# =========================
+# ----------------- HTTP (webhook & healthz) -----------------
 async def handle_healthz(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
@@ -341,6 +473,7 @@ async def on_startup(aio_app: web.Application):
             logger.exception("No se pudo setear webhook")
 
     aio_app["tg_app"] = tg_app
+
     if BROADCAST_CHAT_ID:
         tg_app.job_queue.run_repeating(
             lambda ctx: asyncio.create_task(periodic_job(tg_app)),
