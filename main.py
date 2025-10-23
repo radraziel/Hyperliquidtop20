@@ -65,7 +65,7 @@ async def api_post_json(url: str, payload: Dict[str, Any], timeout=25) -> Any:
 
 
 async def fetch_wallet_state(addr: str) -> Dict[str, Any]:
-    """Consulta estado de la wallet con 2 payloads comunes."""
+    """Consulta estado de la wallet con dos payloads comunes."""
     try:
         data = await api_post_json(HL_INFO, {"type": "clearinghouseState", "user": addr})
         if isinstance(data, dict) and data:
@@ -114,7 +114,7 @@ async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
             try:
                 await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
-                pass  # si no llega a networkidle, seguimos
+                pass  # seguimos aunque no llegue a networkidle
 
             # --------------------------
             # Estrategia A: __NEXT_DATA__
@@ -133,43 +133,30 @@ async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
 """
                 )
                 if data_from_next:
-                    # Buscamos arrays de objetos que tengan señales de leaderboard
-                    def collect_arrays(obj):
-                        out = []
-                        if Array.isArray(obj))  # JS pseudo; lo hacemos en otra eval
-                            return []
-                    # Haremos otra evaluación que haga el recorrido del árbol en JS
                     candidate = await page.evaluate(
                         """
 (json) => {
-  function isObject(x){ return x && typeof x === 'object' && !Array.isArray(x); }
+  function isObj(x){ return x && typeof x === 'object' && !Array.isArray(x); }
   function scoreArray(arr){
     if (!Array.isArray(arr) || arr.length === 0) return 0;
-    let fields = 0;
     const first = arr[0];
-    if (!isObject(first)) return 0;
+    if (!isObj(first)) return 0;
     const keys = Object.keys(first);
-    if (keys.includes('name') || keys.includes('user') || keys.includes('address')) fields++;
-    if (keys.includes('pnl') || keys.includes('profit') || keys.includes('equity')) fields++;
-    if (keys.includes('positionValue') || keys.includes('pv')) fields++;
-    return fields;
+    let score = 0;
+    if (keys.includes('name') || keys.includes('user') || keys.includes('address')) score++;
+    if (keys.includes('pnl') || keys.includes('profit') || keys.includes('equity')) score++;
+    if (keys.includes('positionValue') || keys.includes('pv')) score++;
+    return score;
   }
-  let best = null;
-  let bestScore = 0;
-  function walk(x){
+  let best = null, bestScore = 0;
+  (function walk(x){
     if (Array.isArray(x)){
       const s = scoreArray(x);
-      if (s > bestScore){
-        best = x;
-        bestScore = s;
-      }
+      if (s > bestScore){ best = x; bestScore = s; }
     } else if (x && typeof x === 'object'){
-      for (const k of Object.keys(x)){
-        walk(x[k]);
-      }
+      for (const k of Object.keys(x)) walk(x[k]);
     }
-  }
-  walk(json);
+  })(json);
   return best;
 }
 """,
@@ -180,26 +167,19 @@ async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
                         parsed = []
                         for i, item in enumerate(candidate[:TOP_LIMIT], start=1):
                             name = (
-                                item.get("name")
-                                or item.get("user")
-                                or item.get("address")
-                                or item.get("owner")
-                                or "—"
+                                (item.get("name") or item.get("user") or
+                                 item.get("address") or item.get("owner") or "—")
                             )
                             pv = item.get("positionValue") or item.get("pv")
                             pnl = item.get("pnl") or item.get("profit") or item.get("equity")
-                            chunks = [str(name)]
+                            pieces = [str(name)]
                             if pv is not None:
-                                try:
-                                    chunks.append(f"PV {fmt_money(float(pv))}")
-                                except Exception:
-                                    chunks.append(f"PV {pv}")
+                                try: pieces.append(f"PV {fmt_money(float(pv))}")
+                                except Exception: pieces.append(f"PV {pv}")
                             if pnl is not None:
-                                try:
-                                    chunks.append(f"PnL {fmt_money(float(pnl))}")
-                                except Exception:
-                                    chunks.append(f"PnL {pnl}")
-                            parsed.append({"rank": i, "name": name, "pv": pv, "pnl": pnl, "raw": " | ".join(chunks)})
+                                try: pieces.append(f"PnL {fmt_money(float(pnl))}")
+                                except Exception: pieces.append(f"PnL {pnl}")
+                            parsed.append({"rank": i, "name": name, "pv": pv, "pnl": pnl, "raw": " | ".join(pieces)})
                         if parsed:
                             rows = parsed
             except Exception as e:
@@ -223,7 +203,9 @@ async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
   const body = tbl.querySelector("tbody") || tbl;
   const trs = Array.from(body.querySelectorAll("tr"));
   for (let i = 0; i < trs.length; i++) {
-    const tds = Array.from(trs[i].querySelectorAll("td")).map(td => (td.innerText||'').trim()).filter(Boolean);
+    const tds = Array.from(trs[i].querySelectorAll("td"))
+      .map(td => (td.innerText||'').trim())
+      .filter(Boolean);
     if (tds.length) out.push({ rank: i+1, raw: tds.join(" | "), cols: tds });
   }
   return out;
@@ -343,7 +325,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             except Exception:
                 lines.append(f"• uPnL: {upnl}")
 
-        # Si no hubo campos reconocibles, muestra claves para guiarte
+        # Si no hubo campos reconocibles, muestra claves para guiar el ajuste
         if len(lines) == 1:
             keys = ", ".join(list(state.keys())[:15])
             lines.append(f"(Campos disponibles: {keys} …)")
@@ -408,11 +390,7 @@ def build_web_app() -> web.Application:
             await tg_app.shutdown()
         except Exception:
             pass
-        # No llamar tg_app.post_stop() (puede ser None según versión)
-        # try:
-        #     await tg_app.post_stop()
-        # except Exception:
-        #     pass
+        # No llamar tg_app.post_stop(); puede ser None según versión
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
