@@ -7,15 +7,11 @@ from typing import List, Dict, Any, Optional
 from aiohttp import web
 import httpx
 from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+
 
 # =========================
-# Config / Entorno
+# Configuración
 # =========================
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
@@ -33,17 +29,20 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(mes
 logger.addHandler(handler)
 logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
-# Cache en memoria para TOP
+# Cache simple para TOP
 _cache_rows: List[Dict[str, Any]] = []
 _cache_ts: float = 0.0
 
+
 def cache_valid() -> bool:
     return (time.time() - _cache_ts) < CACHE_TTL_SEC and len(_cache_rows) > 0
+
 
 def set_cache(rows: List[Dict[str, Any]]) -> None:
     global _cache_rows, _cache_ts
     _cache_rows = rows
     _cache_ts = time.time()
+
 
 def fmt_money(x: Optional[float]) -> str:
     try:
@@ -51,147 +50,225 @@ def fmt_money(x: Optional[float]) -> str:
     except Exception:
         return str(x) if x is not None else "—"
 
-# ============== API Hyperliquid (fallback y wallet) ==============
-HL_INFO = "https://api.hyperliquid.xyz/info"  # endpoint común en Hyperliquid
 
-async def api_post_json(url: str, payload: Dict[str, Any], timeout=20) -> Any:
+# =========================
+# APIs de Hyperliquid (wallet)
+# =========================
+HL_INFO = "https://api.hyperliquid.xyz/info"
+
+
+async def api_post_json(url: str, payload: Dict[str, Any], timeout=25) -> Any:
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, json=payload)
         r.raise_for_status()
         return r.json()
 
-async def fetch_top_via_api(limit: int) -> List[Dict[str, Any]]:
-    """
-    Intenta un leaderboard vía API pública de Hyperliquid.
-    Nota: Si Hyperliquid cambia el payload, ajusta aquí.
-    """
-    try:
-        # Algunos despliegues usan distintos "type". Probamos dos opciones.
-        # Opción 1: "leaders"
-        try:
-            data = await api_post_json(HL_INFO, {"type": "leaders"})
-        except Exception:
-            data = await api_post_json(HL_INFO, {"type": "leaderboard"})
-
-        rows: List[Dict[str, Any]] = []
-        if isinstance(data, dict):
-            candidates = data.get("leaders") or data.get("leaderboard") or data.get("data") or []
-        else:
-            candidates = data
-
-        for i, row in enumerate(candidates[:limit], start=1):
-            # Intentamos mapear valores comunes; si no existen, caemos al raw
-            name = row.get("name") or row.get("user") or row.get("address") or "—"
-            pnl = row.get("pnl") or row.get("profit") or row.get("equity") or None
-            pv = row.get("positionValue") or row.get("pv") or None
-            raw = []
-            if name: raw.append(str(name))
-            if pv is not None: raw.append(f"PV {fmt_money(float(pv))}")
-            if pnl is not None: raw.append(f"PnL {fmt_money(float(pnl))}")
-            rows.append({"rank": i, "name": name, "pv": pv, "pnl": pnl, "raw": " | ".join(raw)})
-        return rows
-    except Exception as e:
-        logger.warning("Leaderboard API fallback falló: %s", e)
-        return []
 
 async def fetch_wallet_state(addr: str) -> Dict[str, Any]:
-    """
-    Consulta un estado de clearinghouse para la wallet.
-    """
+    """Consulta estado de la wallet con 2 payloads comunes."""
     try:
-        payload = {"type": "clearinghouseState", "user": addr}
-        data = await api_post_json(HL_INFO, payload)
-        return data if isinstance(data, dict) else {"raw": data}
+        data = await api_post_json(HL_INFO, {"type": "clearinghouseState", "user": addr})
+        if isinstance(data, dict) and data:
+            return data
     except Exception as e:
-        logger.warning("clearinghouseState falló: %s", e)
-        # Plan B: algún otro tipo común
-        try:
-            payload = {"type": "userState", "user": addr}
-            data = await api_post_json(HL_INFO, payload)
-            return data if isinstance(data, dict) else {"raw": data}
-        except Exception as e2:
-            logger.warning("userState también falló: %s", e2)
-            return {}
+        logger.debug("clearinghouseState falló: %s", e)
 
-# ========================= Scraping (Playwright) =========================
+    try:
+        data = await api_post_json(HL_INFO, {"type": "userState", "user": addr})
+        if isinstance(data, dict) and data:
+            return data
+    except Exception as e:
+        logger.debug("userState falló: %s", e)
+
+    return {}
+
+
+# =========================
+# Scraping del Leaderboard
+# =========================
 async def fetch_hyperdash_top() -> List[Dict[str, Any]]:
     """
-    1) Si el cache sirve, devuelve cache.
-    2) Intenta scraping con Playwright.
-    3) Si no ve filas, usa fallback de API (leaders).
+    1) Devuelve cache si está vigente.
+    2) Abre https://hyperliquid.xyz/leaderboard
+       y prueba 3 estrategias para extraer filas:
+         A) __NEXT_DATA__ (Next.js)
+         B) <table>
+         C) [role="row"]
     """
     if cache_valid():
         return _cache_rows
 
     from playwright.async_api import async_playwright
 
-    url = "https://hyperliquid.xyz/portfolio"
-
+    url = "https://hyperliquid.xyz/leaderboard"
     rows: List[Dict[str, Any]] = []
+
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
+
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-            # Espera agresiva al render
+            # Espera extra por si el hydration tarda
             try:
-                await page.wait_for_selector("table, [role='row']", timeout=25000)
+                await page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
-                await page.wait_for_load_state("networkidle", timeout=15000)
+                pass  # si no llega a networkidle, seguimos
 
-            # Intento 1: tabla tradicional
-            rows = await page.evaluate(
-                """
+            # --------------------------
+            # Estrategia A: __NEXT_DATA__
+            # --------------------------
+            try:
+                data_from_next = await page.evaluate(
+                    """
 (() => {
-  const out = [];
-  const tbl = document.querySelector("table");
-  if (tbl) {
-    const body = tbl.querySelector("tbody") || tbl;
-    const trs = Array.from(body.querySelectorAll("tr"));
-    for (let i = 0; i < trs.length; i++) {
-      const tds = Array.from(trs[i].querySelectorAll("td")).map(td => td.innerText.trim());
-      if (tds.length > 0) {
-        out.push({ rank: i+1, raw: tds.join(" | "), cols: tds });
+  try {
+    const el = document.getElementById('__NEXT_DATA__');
+    if (!el) return null;
+    const json = JSON.parse(el.textContent || '{}');
+    return json || null;
+  } catch (e) { return null; }
+})()
+"""
+                )
+                if data_from_next:
+                    # Buscamos arrays de objetos que tengan señales de leaderboard
+                    def collect_arrays(obj):
+                        out = []
+                        if Array.isArray(obj))  # JS pseudo; lo hacemos en otra eval
+                            return []
+                    # Haremos otra evaluación que haga el recorrido del árbol en JS
+                    candidate = await page.evaluate(
+                        """
+(json) => {
+  function isObject(x){ return x && typeof x === 'object' && !Array.isArray(x); }
+  function scoreArray(arr){
+    if (!Array.isArray(arr) || arr.length === 0) return 0;
+    let fields = 0;
+    const first = arr[0];
+    if (!isObject(first)) return 0;
+    const keys = Object.keys(first);
+    if (keys.includes('name') || keys.includes('user') || keys.includes('address')) fields++;
+    if (keys.includes('pnl') || keys.includes('profit') || keys.includes('equity')) fields++;
+    if (keys.includes('positionValue') || keys.includes('pv')) fields++;
+    return fields;
+  }
+  let best = null;
+  let bestScore = 0;
+  function walk(x){
+    if (Array.isArray(x)){
+      const s = scoreArray(x);
+      if (s > bestScore){
+        best = x;
+        bestScore = s;
+      }
+    } else if (x && typeof x === 'object'){
+      for (const k of Object.keys(x)){
+        walk(x[k]);
       }
     }
   }
-  return out;
-})()
-                """
-            )
+  walk(json);
+  return best;
+}
+""",
+                        data_from_next,
+                    )
 
-            # Intento 2: grids con role="row"
+                    if isinstance(candidate, list) and candidate:
+                        parsed = []
+                        for i, item in enumerate(candidate[:TOP_LIMIT], start=1):
+                            name = (
+                                item.get("name")
+                                or item.get("user")
+                                or item.get("address")
+                                or item.get("owner")
+                                or "—"
+                            )
+                            pv = item.get("positionValue") or item.get("pv")
+                            pnl = item.get("pnl") or item.get("profit") or item.get("equity")
+                            chunks = [str(name)]
+                            if pv is not None:
+                                try:
+                                    chunks.append(f"PV {fmt_money(float(pv))}")
+                                except Exception:
+                                    chunks.append(f"PV {pv}")
+                            if pnl is not None:
+                                try:
+                                    chunks.append(f"PnL {fmt_money(float(pnl))}")
+                                except Exception:
+                                    chunks.append(f"PnL {pnl}")
+                            parsed.append({"rank": i, "name": name, "pv": pv, "pnl": pnl, "raw": " | ".join(chunks)})
+                        if parsed:
+                            rows = parsed
+            except Exception as e:
+                logger.debug("__NEXT_DATA__ parse falló: %s", e)
+
+            # --------------------------
+            # Estrategia B: <table>
+            # --------------------------
             if not rows:
-                rows = await page.evaluate(
-                    """
+                try:
+                    await page.wait_for_selector("table", timeout=8000)
+                except Exception:
+                    pass
+                try:
+                    parsed_tbl = await page.evaluate(
+                        """
 (() => {
   const out = [];
-  const rows = Array.from(document.querySelectorAll('[role="row"]'));
-  for (let i = 0; i < rows.length; i++) {
-    const cells = Array.from(rows[i].querySelectorAll('[role="cell"], div, span'))
-      .map(x => (x.innerText || '').trim())
-      .filter(Boolean);
-    if (cells.length >= 1) {
-      out.push({ rank: i + 1, raw: cells.join(" | "), cols: cells });
-    }
+  const tbl = document.querySelector("table");
+  if (!tbl) return out;
+  const body = tbl.querySelector("tbody") || tbl;
+  const trs = Array.from(body.querySelectorAll("tr"));
+  for (let i = 0; i < trs.length; i++) {
+    const tds = Array.from(trs[i].querySelectorAll("td")).map(td => (td.innerText||'').trim()).filter(Boolean);
+    if (tds.length) out.push({ rank: i+1, raw: tds.join(" | "), cols: tds });
   }
   return out;
 })()
-                    """
-                )
+"""
+                    )
+                    if isinstance(parsed_tbl, list) and parsed_tbl:
+                        rows = parsed_tbl
+                except Exception as e:
+                    logger.debug("parse tabla falló: %s", e)
+
+            # --------------------------
+            # Estrategia C: role="row"
+            # --------------------------
+            if not rows:
+                try:
+                    await page.wait_for_selector('[role="row"]', timeout=8000)
+                except Exception:
+                    pass
+                try:
+                    parsed_grid = await page.evaluate(
+                        """
+(() => {
+  const out = [];
+  const rws = Array.from(document.querySelectorAll('[role="row"]'));
+  for (let i = 0; i < rws.length; i++) {
+    const cells = Array.from(rws[i].querySelectorAll('[role="cell"], div, span'))
+      .map(x => (x.innerText || '').trim())
+      .filter(Boolean);
+    if (cells.length >= 2) out.push({ rank: i+1, raw: cells.join(" | "), cols: cells });
+  }
+  return out;
+})()
+"""
+                    )
+                    if isinstance(parsed_grid, list) and parsed_grid:
+                        rows = parsed_grid
+                except Exception as e:
+                    logger.debug("parse grid falló: %s", e)
 
             await context.close()
             await browser.close()
     except Exception as e:
         logger.warning("Scraping falló: %s", e)
         rows = []
-
-    # Si scraping no devolvió nada, plan B: API
-    if not rows:
-        logger.info("Sin filas por scraping; probando API fallback para TOP…")
-        rows = await fetch_top_via_api(TOP_LIMIT)
 
     rows = rows[:TOP_LIMIT]
     if rows:
@@ -209,7 +286,10 @@ def build_top_message(rows: List[Dict[str, Any]]) -> str:
         lines.append(f"{rank}. {raw}")
     return "\n".join(lines)
 
-# ========================= Handlers Telegram =========================
+
+# =========================
+# Handlers de Telegram
+# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         "👋 ¡Hola! Soy el bot de Hyperliquid Top.\n\n"
@@ -220,6 +300,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(msg)
 
+
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         rows = await fetch_hyperdash_top()
@@ -227,6 +308,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.exception("Fallo en /top")
         await update.message.reply_text(f"⚠️ Error al generar el Top: {type(e).__name__}: {e}")
+
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     addr = " ".join(context.args).strip() if context.args else ""
@@ -240,17 +322,33 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("No se pudo obtener estado para esa wallet.")
             return
 
-        # Intento formatear algunos campos comunes
         equity = state.get("equity") or state.get("equityUsd") or state.get("equityUSD")
         pos_val = state.get("positionValue") or state.get("pv") or state.get("position_value")
         upnl = state.get("uPnL") or state.get("unrealizedPnl") or state.get("upnl")
 
         lines = [f"🔎 Wallet: `{addr}`"]
-        if equity is not None: lines.append(f"• Equity: {fmt_money(float(equity))}")
-        if pos_val is not None: lines.append(f"• Position Value: {fmt_money(float(pos_val))}")
-        if upnl is not None: lines.append(f"• uPnL: {fmt_money(float(upnl))}")
+        if equity is not None:
+            try:
+                lines.append(f"• Equity: {fmt_money(float(equity))}")
+            except Exception:
+                lines.append(f"• Equity: {equity}")
+        if pos_val is not None:
+            try:
+                lines.append(f"• Position Value: {fmt_money(float(pos_val))}")
+            except Exception:
+                lines.append(f"• Position Value: {pos_val}")
+        if upnl is not None:
+            try:
+                lines.append(f"• uPnL: {fmt_money(float(upnl))}")
+            except Exception:
+                lines.append(f"• uPnL: {upnl}")
 
-        # Si trae posiciones en algún arreglo:
+        # Si no hubo campos reconocibles, muestra claves para guiarte
+        if len(lines) == 1:
+            keys = ", ".join(list(state.keys())[:15])
+            lines.append(f"(Campos disponibles: {keys} …)")
+
+        # Posiciones si existieran
         positions = state.get("positions") or state.get("openPositions") or []
         if isinstance(positions, list) and positions:
             lines.append(f"\nPosiciones activas ({min(len(positions),5)} mostradas):")
@@ -265,12 +363,16 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("Fallo en /wallet")
         await update.message.reply_text(f"⚠️ Error consultando wallet: {type(e).__name__}: {e}")
 
+
 def wire_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
 
-# ========================= Webhook (aiohttp) =========================
+
+# =========================
+# Webhook (aiohttp)
+# =========================
 async def handle_webhook(request: web.Request) -> web.Response:
     if request.query.get("secret") != WEBHOOK_SECRET:
         return web.Response(status=403, text="forbidden")
@@ -279,6 +381,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
     return web.json_response({"ok": True})
+
 
 def build_web_app() -> web.Application:
     app = web.Application()
@@ -296,9 +399,20 @@ def build_web_app() -> web.Application:
         logger.info("Webhook configurado -> %s", webhook_url)
 
     async def on_cleanup(_: web.Application):
-        await tg_app.stop()
-        await tg_app.shutdown()
-        await tg_app.post_stop()
+        # Evita errores si ya no está corriendo
+        try:
+            await tg_app.stop()
+        except Exception:
+            pass
+        try:
+            await tg_app.shutdown()
+        except Exception:
+            pass
+        # No llamar tg_app.post_stop() (puede ser None según versión)
+        # try:
+        #     await tg_app.post_stop()
+        # except Exception:
+        #     pass
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -307,10 +421,12 @@ def build_web_app() -> web.Application:
     app.router.add_get("/", lambda r: web.Response(status=404, text="Not Found"))
     return app
 
+
 def main():
     if PW_PATH and os.path.isdir(PW_PATH):
         logger.info("PLAYWRIGHT_BROWSERS_PATH=%s", PW_PATH)
     web.run_app(build_web_app(), host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
